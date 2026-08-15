@@ -1,12 +1,17 @@
 ---
-description: Do maths with a CAS, a solver and a numeric prober instead of from memory, verify every step that survives into the answer, and hold multi-formula work in a symbol/relation context that can be resolved, impacted and audited.
-argument-hint: [equation, derivation, paper section, or the model maths being iterated]
+description: Field-agnostic maths engine. Do the maths with a CAS, a solver, a fuzzer and a numeric prober instead of from memory, verify every step that survives into the answer, and hold multi-formula work in a symbol/relation context that can be resolved, impacted and audited. Hands off to a domain command where one exists, /ml-math for machine learning.
+argument-hint: [equation, derivation, paper section, or the maths being iterated]
 ---
 
 Work through: **$ARGUMENTS**
 
 With no argument, find the maths currently under discussion in the repo or the conversation, and
 say which you picked.
+
+This is the engine, and it is deliberately field-agnostic: parse, verify, fuzz, track, report.
+The field layer sits on top of it. If the maths is machine learning, run `/ml-math` instead,
+which is this ladder plus the conventions, formulas and known-wrong variants of that field. For
+a field with no dedicated command, Step 10 is how to bolt one together.
 
 You cannot certify your own algebra. A wrong simplification and a right one are the same
 number of tokens and read identically. So derive however you like, but **every claim that
@@ -66,12 +71,12 @@ The ladder, add only what the task needs:
 - **always**: `sympy`, `mpmath`, `numpy`
 - **fuzzing the domain, and shrinking counterexamples**: `hypothesis`
 - **inequalities, constraints, "does this hold for all x"**: `z3-solver`
-- **shapes and contraction cost**: `opt_einsum`, `einops`, `jaxtyping` + `beartype`
-- **bf16 and fp8 limits without a GPU**: `ml_dtypes`, or the project's `torch`
-- **gradients against autograd**: the project's `torch` or `jax`, not a fresh one
+- **fitting, quadrature, finite-difference gradient checks, structural analysis**: `scipy`,
+  `networkx`
+- **units and dimensions**: `sympy.physics.units`, or `pint` for measurement-heavy work
 - **LaTeX in**: `lark`, and call `parse_latex(s, backend="lark")`. The default ANTLR backend
   demands `antlr4-python3-runtime` at exactly 4.11 and raises an ImportError otherwise
-- **fitting, quadrature, structural analysis**: `scipy`, `networkx`
+- **the field's own packages**: from the domain command, or Step 10 if there is not one
 
 Print `sympy.__version__` and `mpmath.__version__` in the header of every script and in the
 report. Symbolic output is version-dependent, and a result nobody can reproduce is not a
@@ -127,9 +132,10 @@ SI._collect_factor_and_dimension(meter + second)
 # ValueError: Dimension of "second" is Dimension(time, T), but it should be Dimension(length, L)
 ```
 
-For unitless ML quantities the same tier is the shape check in Step 10. Do not skip it because
-the quantities are dimensionless: `n_tokens` and `n_sequences` are both counts and adding them
-is still wrong.
+Where the quantities carry no units, this tier is whatever the field's cheap conservation law is
+(Step 10): shapes and named axes, a density integrating to 1, a mass balance, a parity argument.
+Do not skip the tier because the quantities are dimensionless. Two counts of different things
+are still not addable, and `n_tokens + n_sequences` is a bug that no amount of algebra finds.
 
 **Tier 2, structural.** `sp.srepr(a) == sp.srepr(b)`, or `a == b` for structural equality.
 Instant, and settles the boring cases where the two expressions really are the same tree.
@@ -191,9 +197,9 @@ s.check()          # unsat, so the inequality is proved
 s2 = Solver(); s2.add(Not(Implies(x > 0, x*x >= x)))
 s2.check(), s2.model()      # sat, [x = 1/2], claim is false at x = 1/2
 
-d, h = Ints("d_model n_heads")
-s4 = Solver(); s4.add(d == 768, h == 10, d % h == 0)
-s4.check()         # unsat, that head count does not divide that width
+n, k = Ints("n_items n_groups")
+s4 = Solver(); s4.add(n == 768, k == 10, n % k == 0)
+s4.check()         # unsat, that split does not divide evenly
 ```
 
 Nonlinear real arithmetic is not complete in z3 and it will return `unknown` or run forever, so
@@ -322,20 +328,20 @@ every assumption in play.
 **Collapse and rerank: the failures a scalar comparison cannot see.** A result can be numerically
 close and still useless, because what was actually being used was the ordering or the structure.
 
-- **Degenerate inputs**, which is where these live: all-equal logits, duplicate or near-duplicate
+- **Degenerate inputs**, which is where these live: all-equal scores, duplicate or near-duplicate
   rows, the zero vector, a single dominant element, exact ties, a rank-deficient matrix.
 - **Reranking.** When the output orders things (top-k, argmax, selection, routing, a leaderboard),
   check the **permutation**, not the value. Perturb the input by the noise floor and count how
-  often the top-k membership changes. Measured on 64 logits under 1e-3 noise: **0.0 flip rate
+  often the top-k membership changes. Measured on 64 random scores under 1e-3 noise: **0.0 flip rate
   when well separated, 0.995 when near-tied.** The values moved by 1e-3 in both cases. A ranking
   with a 0.995 flip rate is noise wearing a result's clothing, and no amount of extra precision
   in the formula fixes it.
 
 ```python
-def topk_flip_rate(logits, eps, k=5, trials=200, seed=0):
+def topk_flip_rate(scores, eps, k=5, trials=200, seed=0):
     r = np.random.default_rng(seed)
-    base = set(np.argsort(-logits)[:k])
-    return sum(set(np.argsort(-(logits + r.normal(0, eps, logits.shape)))[:k]) != base
+    base = set(np.argsort(-scores)[:k])
+    return sum(set(np.argsort(-(scores + r.normal(0, eps, scores.shape)))[:k]) != base
                for _ in range(trials)) / trials
 ```
 
@@ -344,7 +350,7 @@ def topk_flip_rate(logits, eps, k=5, trials=200, seed=0):
   column duplicated to within 1e-12 still comes back rank 8, while `np.linalg.cond` moves from
   54 to 2.06e13. Report `cond` at the sampled points. A formula that is fine at cond 1e3 and
   garbage at cond 1e12 has a validity condition nobody wrote down.
-- **Saturation**, which is the same failure in the other direction: softmax at large logits,
+- **Saturation**, which is the same failure in the other direction: softmax at large inputs,
   sigmoid tails, `log` of near-zero, division by near-zero.
 
 Every genuine failure point found here is worth more as a permanent case than as a sentence in
@@ -440,85 +446,62 @@ against MoE. Fork the context file, change one thing, diff the resolved values. 
 reconciling a paper against an implementation, match on semantics and shape to propose the
 symbol mapping, then make the user confirm it.
 
-## Step 9. Where a generic CAS stops being enough: gradients and layout
+## Step 9. A derivative is a claim until something independent agrees
 
-**Declare the layout convention once, in writing, at the top of the file.** Numerator layout or
-denominator layout. Layout confusion silently ruins more matrix derivations than every other
-cause combined, and it produces results that are transposes of correct, which look correct.
-
-Sympy will do some of it directly, for example `sp.diff(sp.Trace(X.T*X), X).doit()` gives `2*X`,
-and `sp.derive_by_array` plus `sp.hessian` cover the elementwise cases. But a closed-form
-gradient is a **claim** until autograd disagrees or fails to:
+Closed-form derivatives are where careful people make silent errors, and the error is usually a
+sign, a factor, or a transpose, all of which look correct. Sympy will do the simple cases
+(`sp.diff`, `sp.derive_by_array`, `sp.hessian`, and `sp.diff(sp.Trace(X.T*X), X).doit()` gives
+`2*X`), but the check is a second, structurally different computation:
 
 ```python
-import torch
+from scipy.optimize import check_grad
+check_grad(f, my_closed_form_grad, x0)          # finite differences, any callable
+
+import torch                                     # when the maths is about torch code
 x = torch.randn(7, 3, dtype=torch.double, requires_grad=True)   # float64, not float32
-torch.autograd.gradcheck(f, (x,), eps=1e-6, atol=1e-5)          # analytic vs finite diff
-torch.testing.assert_close(my_closed_form(x), torch.func.jacrev(f)(x))
+torch.autograd.gradcheck(f, (x,), eps=1e-6, atol=1e-5)
 ```
 
-float64 is not optional here; in float32 the finite-difference reference is noisier than the
-error being looked for. Test at the awkward inputs too: at zero, at the non-differentiable
-kink, at near-duplicate rows, at the point the assumption says is excluded.
+float64 is not optional; in float32 the finite-difference reference is noisier than the error
+being hunted. Check at the awkward inputs as well as the easy ones: zero, the non-differentiable
+kink, near-duplicate rows, and the point the assumption excludes.
 
-## Step 10. Shapes, cost, and precision
+For matrix and tensor derivatives, **write the layout convention down before deriving**,
+numerator or denominator. Layout confusion produces results that are transposes of correct.
+`/ml-math` carries the rest.
 
-**Shapes.** Name the dimensions once and resolve the ambiguity explicitly. `B` is tokens or
-sequences, never both, and writing down which one it is here is worth more than any later
-check. `jaxtyping` annotations plus `beartype` enforce it at runtime; `einops` patterns fail
-loudly and with the actual numbers, for example refusing to split an axis of length 6 into
-`h=4`. Prefer a named-axis rearrange over a bare `.view()` in anything being derived.
+## Step 10. Specialising to a field
 
-**Contraction cost.** `opt_einsum.contract_path` gives FLOPs and peak intermediate size without
-running anything:
+Every field has two things this engine needs, and they are worth finding **before** deriving
+rather than after.
 
-```python
-path, info = oe.contract_path("bqhd,bkhd->bhqk", q, k)
-info.opt_cost               # 1.718e10 FLOPs at B=8, S=1024, H=16, D=64
-info.largest_intermediate   # 1.342e8 elements, the score matrix
-```
+- **A cheap conservation law**, which becomes Tier 1 and catches an embarrassing fraction of
+  errors for almost no cost.
+- **An independent oracle**, a slow and obviously-correct computation to check the fast clever
+  one against. Brute force at small n is a proof for the case it covers.
 
-Note when the optimised path equals the naive one, as it does for a two-operand contraction:
-there is no reordering to win, and the only remaining lever is not forming the intermediate at
-all. Report both numbers, since "fewer FLOPs at four times peak memory" is not a win.
-
-**Architecture maths.** Parameters, FLOPs per token, activation memory and KV-cache size go into
-the context as relations, and then `resolve(peak_memory, given={...})` shows its work.
-Then cross-check the closed form against reality, which is two lines and catches a wrong
-formula immediately:
-
-```python
-assert closed_form_params(cfg) == sum(p.numel() for p in model.parameters())
-```
-
-**Precision.** Probe the expression at the representable limits of the dtype actually in use,
-not in float64, and get the limits from the library rather than from memory: `np.finfo` for
-fp32 and fp16, `ml_dtypes.finfo` for bf16 and fp8 (note it is `ml_dtypes.finfo`, since
-`np.finfo` raises on those), `torch.finfo` when torch is already there.
-
-| dtype | max | eps |
+| field | tier 1, cheap | independent oracle |
 | --- | --- | --- |
-| float32 | 3.40e38 | 1.19e-7 |
-| float16 | 65504 | 9.77e-4 |
-| bfloat16 | 3.39e38 | 7.81e-3 |
-| float8_e4m3fn | 448 | 0.125 |
-| float8_e5m2 | 57344 | 0.25 |
+| physics, engineering | units and dimensions | limiting cases, known solutions |
+| machine learning | shapes and named axes | autograd, and a counting loop |
+| statistics | density integrates to 1, support | Monte Carlo simulation |
+| combinatorics | parity, small-n sanity | exhaustive enumeration |
+| finance | currency and time units, no-arbitrage | replication, path simulation |
+| signal processing | energy, Parseval | FFT round trip |
+| chemistry | mass and charge balance | stoichiometric solve |
+| geometry | invariants, degrees of freedom | numeric construction |
 
-bf16 has fp32's range and a sixty-five times coarser epsilon, which is why the failures it
-causes are accumulation and cancellation rather than overflow, and why they do not show up in a
-float64 check at all. fp8 e4m3 saturating at 448 means the scaling factor is part of the maths,
-not an implementation detail.
+Then find the field's own three things, which no general tool knows:
 
-Then run the Step 6 out-of-bounds set in that dtype. The classic: naive softmax at logits of
-800 returns `[nan, nan, 0]` while the max-subtracted form returns the right answer, and the
-symbolic expressions for the two are identical. This is the whole reason the algebraic check is
-not sufficient on its own.
+- **The notation ambiguity that bites**, resolved once and written down. Every field has one.
+- **The known-wrong variant** of each canonical formula, since the wrong one circulates too and
+  is usually the one that is easier to remember.
+- **The reference values**, real numbers from real published cases, so a formula can be
+  evaluated against something that is known to be right.
 
-Integer and divisibility constraints (`d_model % n_heads`, sequence length against block size,
-vocab against tensor parallel degree) go to z3, which answers them exactly.
-
-**Scaling laws and fits.** An empirical fit is a relation of kind `empirical-fit` and carries
-its fitted range. Extrapolating outside it is a new claim, and gets said out loud.
+When a dedicated command exists for the field, use it rather than improvising: `/ml-math` for
+machine learning. When one does not, build the three things above into the Step 7 context as
+relations with provenance, and say in the report that the field layer was improvised.
 
 ## Step 11. Report
 
