@@ -21,6 +21,32 @@ Not this:
 - saying "verified" when only one tier of the ladder ran
 - `pip install` or `uv install` into the project's environment
 - a registry of variables and formulas for a problem that has two of each
+- one seed, then a verdict
+
+## Deterministic first, and one seed is not a result
+
+A check that gives a different answer on the second run has not checked anything. Seed
+everything at the top of the script and print the seed with the verdict: `random.Random(seed)`,
+`np.random.default_rng(seed)`, `torch.manual_seed(seed)`, `hypothesis` under
+`@settings(derandomize=True)`, z3 under a fixed `timeout` rather than a wall-clock race. Where
+a tool is nondeterministic by nature, pin what can be pinned and **name what could not**, since
+that is where a flapping verdict will come from later.
+
+Deterministic is not the same as sufficient. One seed samples one path through the domain, so
+a single "no counterexample found" is the weakest possible evidence dressed as a result.
+
+- **Default to 3 seeds.** Use **5** when the claim is load-bearing: it goes in a paper, it sets
+  a hyperparameter, it gates a training run, or another derivation is about to build on it.
+- More than 5 only when each run is cheap and the verdict sits near the boundary. If 5 seeds do
+  not settle it, more seeds are not the missing ingredient, a different tier is.
+- **The seeds must agree.** All agree, report the verdict with the seed count. Any disagreement
+  and the verdict is **unknown**, reported with both outcomes and the seeds that produced them.
+  A proof is never a majority vote, and the seed that agreed with you is never the one to quote.
+- For numbers rather than verdicts (fits, condition numbers, timings, flip rates), report the
+  median and the spread across seeds. If the spread crosses the decision boundary, the decision
+  is not supported by the measurement, whatever the median says.
+
+Report the seed list itself, not the word "seeded".
 
 ## Step 0. An environment, without touching the project's
 
@@ -38,8 +64,10 @@ to the project is a question for the user, never a side effect.
 The ladder, add only what the task needs:
 
 - **always**: `sympy`, `mpmath`, `numpy`
+- **fuzzing the domain, and shrinking counterexamples**: `hypothesis`
 - **inequalities, constraints, "does this hold for all x"**: `z3-solver`
 - **shapes and contraction cost**: `opt_einsum`, `einops`, `jaxtyping` + `beartype`
+- **bf16 and fp8 limits without a GPU**: `ml_dtypes`, or the project's `torch`
 - **gradients against autograd**: the project's `torch` or `jax`, not a fresh one
 - **LaTeX in**: `lark`, and call `parse_latex(s, backend="lark")`. The default ANTLR backend
   demands `antlr4-python3-runtime` at exactly 4.11 and raises an ImportError otherwise
@@ -99,7 +127,7 @@ SI._collect_factor_and_dimension(meter + second)
 # ValueError: Dimension of "second" is Dimension(time, T), but it should be Dimension(length, L)
 ```
 
-For unitless ML quantities the same tier is the shape check in Step 9. Do not skip it because
+For unitless ML quantities the same tier is the shape check in Step 10. Do not skip it because
 the quantities are dimensionless: `n_tokens` and `n_sequences` are both counts and adding them
 is still wrong.
 
@@ -135,10 +163,11 @@ def find_counterexample(e1, e2, syms, n=200, tol=1e-8, seed=0):
     return None
 ```
 
-Fixed seed, always. Restrict the draw to the declared domain, then deliberately push at its
-edge: zero, the sign flip, tiny, huge, and the poles of anything in the expression. A probe
-that finds nothing is worth stating as "no counterexample in 200 draws over D", which is not
-the same sentence as "proved".
+Restrict the draw to the declared domain, then deliberately push at its edge: zero, the sign
+flip, tiny, huge, and the poles of anything in the expression. Run it under the seed set from
+the section above, 3 by default, and a probe that finds nothing across all of them is worth
+stating as "no counterexample in 3 x 200 draws over D", which is not the same sentence as
+"proved". A hand-rolled loop like this one is the floor; Step 6 fuzzes properly.
 
 Then check the counterexample before believing it. Pushing at the edge means landing on
 singularities, and a NaN at a removable one is a domain artefact rather than a refutation: this
@@ -190,7 +219,7 @@ Everything after the first bad step is meaningless, so stop there. When a step i
 rather than an identity, name the rule that licenses it (chain rule, linearity of expectation,
 Cauchy-Schwarz, iid factorisation) and check the rule's own precondition holds at that point.
 A step that is only valid in a limit or a regime carries that condition forward to every later
-step, which is what Step 7's closure query is for.
+step, which is what Step 8's closure query is for.
 
 ## Step 4. Name the transform, do not reach for `simplify`
 
@@ -247,7 +276,81 @@ When the budget fires, the answer is "unknown, integrate timed out at 5s", which
 about the tool. It is never "this has no closed form", which is a claim about mathematics that
 the timeout did not establish.
 
-## Step 6. Build the context only when the maths is bigger than one equation
+## Step 6. Fuzz the domain, then step outside it
+
+The edge points in Step 2 catch what you thought to list. Fuzzing catches what you did not, and
+out-of-bounds testing tells you whether the conditions attached to the claim are the real ones.
+
+**Fuzz, and let it shrink.** The reason to use `hypothesis` over a sampling loop is not coverage,
+it is **shrinking**: the loop reports the first failing point it happened to draw, and hypothesis
+reduces it to the smallest one. On the same false identity the loop returned `w = -1000` and
+hypothesis returned `w = -1.0`, which is the difference between a data point and an explanation.
+
+```python
+from hypothesis import given, strategies as st, settings, example
+
+@settings(derandomize=True, max_examples=300)     # deterministic, no flapping CI
+@example(0.0)                                     # pin every counterexample ever found,
+@example(-1.0)                                    # one per line: @a @b is a matmul, not two
+@given(st.floats(min_value=-1e6, max_value=1e6, allow_nan=False, allow_infinity=False))
+def test_identity(w):
+    assert math.isclose(math.sqrt(w*w), w, rel_tol=1e-9, abs_tol=1e-12)
+```
+
+`derandomize=True` makes it repeatable, and `@example` turns every counterexample the fuzzer
+has ever found into a permanent case, so a fixed bug stays fixed. Build strategies that respect
+the declared domain (`st.integers(min_value=1)` for a count, `st.floats(0, 1)` for a
+probability) rather than filtering afterwards, since a heavily filtered strategy just times out.
+
+**Out of bounds is a test, not an accident.** Evaluate deliberately outside the stated domain
+and read the result as three different findings:
+
+- it **breaks immediately** outside: the condition is real and load-bearing. Record the failure
+  mode next to it, because that is what makes the condition survive being edited later.
+- it **still holds well outside**: the stated condition is over-tight, or copied from a source
+  that needed it for a different reason. An assumption nobody needs is an assumption someone
+  will drop silently, so chase it down rather than leaving it decorative.
+- it **degrades**: find where. That boundary is the real validity condition, and it goes back
+  into the relation's `valid_when` in Step 7 so `resolve` refuses to route through it out of
+  range.
+
+The standing out-of-bounds set: 0, plus and minus 1, plus and minus machine epsilon, plus and
+minus 1/epsilon, the dtype's max and tiny, denormals, `n = 0` and `n = 1` and `n = 2`, an empty
+input, exactly 0 and exactly 1 for anything that is a probability, and the excluded point of
+every assumption in play.
+
+**Collapse and rerank: the failures a scalar comparison cannot see.** A result can be numerically
+close and still useless, because what was actually being used was the ordering or the structure.
+
+- **Degenerate inputs**, which is where these live: all-equal logits, duplicate or near-duplicate
+  rows, the zero vector, a single dominant element, exact ties, a rank-deficient matrix.
+- **Reranking.** When the output orders things (top-k, argmax, selection, routing, a leaderboard),
+  check the **permutation**, not the value. Perturb the input by the noise floor and count how
+  often the top-k membership changes. Measured on 64 logits under 1e-3 noise: **0.0 flip rate
+  when well separated, 0.995 when near-tied.** The values moved by 1e-3 in both cases. A ranking
+  with a 0.995 flip rate is noise wearing a result's clothing, and no amount of extra precision
+  in the formula fixes it.
+
+```python
+def topk_flip_rate(logits, eps, k=5, trials=200, seed=0):
+    r = np.random.default_rng(seed)
+    base = set(np.argsort(-logits)[:k])
+    return sum(set(np.argsort(-(logits + r.normal(0, eps, logits.shape)))[:k]) != base
+               for _ in range(trials)) / trials
+```
+
+- **Conditioning, and why rank is the wrong detector.** `np.linalg.matrix_rank` applies a
+  tolerance and happily reports full rank on a matrix that is numerically dead: an 8x8 with one
+  column duplicated to within 1e-12 still comes back rank 8, while `np.linalg.cond` moves from
+  54 to 2.06e13. Report `cond` at the sampled points. A formula that is fine at cond 1e3 and
+  garbage at cond 1e12 has a validity condition nobody wrote down.
+- **Saturation**, which is the same failure in the other direction: softmax at large logits,
+  sigmoid tails, `log` of near-zero, division by near-zero.
+
+Every genuine failure point found here is worth more as a permanent case than as a sentence in
+a report. Pin it with `@example`, and write it into the relation's validity condition.
+
+## Step 7. Build the context only when the maths is bigger than one equation
 
 Everything above works on one expression at a time, and cannot see the errors that live
 *between* formulas: B meaning sequences in one equation and tokens in another, a factor of two
@@ -283,7 +386,7 @@ auto-registered as provisional with their type inferred from use, and get flagge
 rather than raising. Demand an explicit declaration only where the ambiguity actually bites,
 which in practice is units, shapes, and anything counted.
 
-## Step 7. The queries that pay for the context
+## Step 8. The queries that pay for the context
 
 Six verbs, parameterised by noun. Not twenty near-duplicate tools.
 
@@ -337,7 +440,7 @@ against MoE. Fork the context file, change one thing, diff the resolved values. 
 reconciling a paper against an implementation, match on semantics and shape to propose the
 symbol mapping, then make the user confirm it.
 
-## Step 8. Where a generic CAS stops being enough: gradients and layout
+## Step 9. Where a generic CAS stops being enough: gradients and layout
 
 **Declare the layout convention once, in writing, at the top of the file.** Numerator layout or
 denominator layout. Layout confusion silently ruins more matrix derivations than every other
@@ -358,7 +461,7 @@ float64 is not optional here; in float32 the finite-difference reference is nois
 error being looked for. Test at the awkward inputs too: at zero, at the non-differentiable
 kink, at near-duplicate rows, at the point the assumption says is excluded.
 
-## Step 9. Shapes, cost, and precision
+## Step 10. Shapes, cost, and precision
 
 **Shapes.** Name the dimensions once and resolve the ambiguity explicitly. `B` is tokens or
 sequences, never both, and writing down which one it is here is worth more than any later
@@ -389,23 +492,46 @@ assert closed_form_params(cfg) == sum(p.numel() for p in model.parameters())
 ```
 
 **Precision.** Probe the expression at the representable limits of the dtype actually in use,
-not in float64. Check where it overflows, where subtracting nearly equal numbers destroys the
-result, and whether the softmax is the max-subtracted form. Integer and divisibility
-constraints (`d_model % n_heads`, sequence length against block size, vocab against tensor
-parallel degree) go to z3, which answers them exactly.
+not in float64, and get the limits from the library rather than from memory: `np.finfo` for
+fp32 and fp16, `ml_dtypes.finfo` for bf16 and fp8 (note it is `ml_dtypes.finfo`, since
+`np.finfo` raises on those), `torch.finfo` when torch is already there.
+
+| dtype | max | eps |
+| --- | --- | --- |
+| float32 | 3.40e38 | 1.19e-7 |
+| float16 | 65504 | 9.77e-4 |
+| bfloat16 | 3.39e38 | 7.81e-3 |
+| float8_e4m3fn | 448 | 0.125 |
+| float8_e5m2 | 57344 | 0.25 |
+
+bf16 has fp32's range and a sixty-five times coarser epsilon, which is why the failures it
+causes are accumulation and cancellation rather than overflow, and why they do not show up in a
+float64 check at all. fp8 e4m3 saturating at 448 means the scaling factor is part of the maths,
+not an implementation detail.
+
+Then run the Step 6 out-of-bounds set in that dtype. The classic: naive softmax at logits of
+800 returns `[nan, nan, 0]` while the max-subtracted form returns the right answer, and the
+symbolic expressions for the two are identical. This is the whole reason the algebraic check is
+not sufficient on its own.
+
+Integer and divisibility constraints (`d_model % n_heads`, sequence length against block size,
+vocab against tensor parallel degree) go to z3, which answers them exactly.
 
 **Scaling laws and fits.** An empirical fit is a relation of kind `empirical-fit` and carries
 its fitted range. Extrapolating outside it is a new claim, and gets said out loud.
 
-## Step 10. Report
+## Step 11. Report
 
 Every claim in the report carries how it was checked:
 
 - the verdict word, proved or disproved or unknown, and the tier that produced it
-- for disproved, the counterexample point and the size of the disagreement
+- for disproved, the counterexample point, shrunk, and the size of the disagreement
 - for unknown, the methods tried and the budget each was given
 - the transforms used, by name, never "simplified"
-- package versions, and the seed
+- package versions, and the seed list, with any seed that disagreed called out
+- the fuzz budget actually spent, as "no counterexample in 3 x 300 examples over D"
+- the out-of-bounds points tried and what each did: held, degraded, or collapsed
+- for anything ordered, the flip rate under noise-floor perturbation, not just the value
 - the assumptions the result rests on, from the closure query
 - what was left unchecked, and what would catch it
 
